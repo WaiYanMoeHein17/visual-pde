@@ -34,8 +34,8 @@ export function clearShaderTop() {
 
     void main()
     {
-        float x = MINX + textureCoords.x * float(nXDisc) * dx;
-        float y = MINY + textureCoords.y * float(nYDisc) * dy;
+        float x = MINX + textureCoords.x * L_x;
+        float y = MINY + textureCoords.y * L_y;
     `;
 }
 

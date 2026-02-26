@@ -10,6 +10,8 @@ export function computeDisplayFunShaderTop() {
     uniform float L_y;
     uniform float L_min;
     uniform float t;
+    uniform float dgOrder;
+    uniform bool dgActive;
     uniform bool customSurface;
     uniform bool vectorField;
     uniform bool overlayLine;
@@ -32,6 +34,55 @@ export function computeDisplayFunShaderTop() {
       return sqrt(sqrt(zERF*zERF - yERF * INV_ALPHA) - zERF) * sign(pERF);
     }
 
+    int dgWrapIndex(int idx, int n) {
+      int m = idx % n;
+      if (m < 0) {
+        m += n;
+      }
+      return m;
+    }
+
+    vec4 dgSampleAtIndex(int idx) {
+      ivec2 texSize = textureSize(textureSource,0);
+      float step_x = 1.0 / float(texSize.x);
+      int wrapped = dgWrapIndex(idx, texSize.x);
+      vec2 coord = vec2((float(wrapped) + 0.5) * step_x, textureCoords.y);
+      return texture2D(textureSource, coord);
+    }
+
+    float dgLagrange(float xi, int j, int order) {
+      float res = 1.0;
+      for (int m = 0; m < 5; m++) {
+        if (m <= order && m != j) {
+          res *= (xi - float(m)) / (float(j) - float(m));
+        }
+      }
+      return res;
+    }
+
+    vec4 dgReconstruct(float xCoord) {
+      int order = int(dgOrder + 0.5);
+      int nodesPerElem = order + 1;
+      float xWrapped = xCoord;
+      if (xWrapped < MINX) {
+        xWrapped += L_x;
+      }
+      if (xWrapped >= MINX + L_x) {
+        xWrapped -= L_x;
+      }
+      float elemFloat = floor((xWrapped - MINX) / (float(order) * dx));
+      int elem = int(elemFloat);
+      float xi = (xWrapped - MINX) / dx - elemFloat * float(order);
+      vec4 value = vec4(0.0);
+      for (int j = 0; j < 5; j++) {
+        if (j <= order) {
+          int idx = elem * nodesPerElem + j;
+          value += dgSampleAtIndex(idx) * dgLagrange(xi, j, order);
+        }
+      }
+      return value;
+    }
+
     void main()
     {
        `;
@@ -45,11 +96,22 @@ export function computeDisplayFunShaderMid() {
         float x = MINX + textureCoords.x * L_x;
         float y = MINY + textureCoords.y * L_y;
 
-        vec4 uvwq = texture2D(textureSource, textureCoords);
-        vec4 uvwqL = texture2D(textureSource, textureCoords + vec2(-step_x, 0.0));
-        vec4 uvwqR = texture2D(textureSource, textureCoords + vec2(+step_x, 0.0));
-        vec4 uvwqT = texture2D(textureSource, textureCoords + vec2(0.0, +step_y));
-        vec4 uvwqB = texture2D(textureSource, textureCoords + vec2(0.0, -step_y));
+        vec4 uvwq = dgActive ? dgReconstruct(x) : texture2D(textureSource, textureCoords);
+        vec4 uvwqL;
+        vec4 uvwqR;
+        vec4 uvwqT;
+        vec4 uvwqB;
+        if (dgActive) {
+          uvwqL = dgReconstruct(x - dx);
+          uvwqR = dgReconstruct(x + dx);
+          uvwqT = uvwq;
+          uvwqB = uvwq;
+        } else {
+          uvwqL = texture2D(textureSource, textureCoords + vec2(-step_x, 0.0));
+          uvwqR = texture2D(textureSource, textureCoords + vec2(+step_x, 0.0));
+          uvwqT = texture2D(textureSource, textureCoords + vec2(0.0, +step_y));
+          uvwqB = texture2D(textureSource, textureCoords + vec2(0.0, -step_y));
+        }
 
         vec4 uvwqX = (uvwqR - uvwqL) / (2.0*dx);
         vec4 uvwqY = (uvwqT - uvwqB) / (2.0*dy);

@@ -49,8 +49,15 @@ import {
   RDShaderGhostX,
   RDShaderGhostY,
   RDShaderMain,
+  RDShaderMainDG,
+  RDShaderTopDG,
+  RDShaderDGComputeRHS,
+  RDShaderDGBoundaryAvg,
+  RDShaderBotMRT,
   clampSpeciesToEdgeShader,
 } from "./simulation_shaders.js";
+import { aderDgTimestep } from "./ader_dg.js";
+import { GPUProfiler } from "./gpu_profiler.js";
 import { randShader, randNShader } from "../rand_shader.js";
 import {
   fiveColourDisplayTop,
@@ -106,6 +113,7 @@ if (expandingOptionsInProgress) {
 async function VisualPDE(url) {
   let canvas, gl, manualInterpolationNeeded, camCanvas;
   let camera, simCamera, scene, simScene, renderer, aspectRatio, controls;
+  let gpuProfiler;
   let simTextures = [],
     postTexture,
     interpolationTexture,
@@ -113,7 +121,8 @@ async function VisualPDE(url) {
     clickTexture,
     simTextureOpts,
     minMaxTextures = [],
-    checkpointTexture;
+    checkpointTexture,
+    mrtTargets;
   let displayMaterial,
     drawMaterial,
     clickMaterial,
@@ -179,6 +188,7 @@ async function VisualPDE(url) {
     canTimeStep = true,
     simObserver,
     hasErrored = false,
+    dgDimensionWarningShown = false,
     canAutoPause = true,
     autoPauseStopValue = 0,
     isDrawing,
@@ -301,6 +311,8 @@ async function VisualPDE(url) {
 
   // Setup some configurable options.
   options = {};
+  // Kernel fusion defaults to off; toggle with 'f' key or ?fusedKernels=1 URL param.
+  options.fusedKernels = false;
 
   // List of fields that the user can type into.
   const userTextFields = getUserTextFields();
@@ -485,6 +497,11 @@ async function VisualPDE(url) {
     if (isNaN(domainScaleFactor) || domainScaleFactor <= 0) {
       domainScaleFactor = 1;
     }
+  }
+
+  // Enable kernel fusion via URL parameter.
+  if (params.has("fusedKernels")) {
+    options.fusedKernels = true;
   }
 
   if (inIframe()) {
@@ -958,6 +975,7 @@ async function VisualPDE(url) {
     });
     renderer.autoClear = false;
     gl = renderer.getContext();
+    gpuProfiler = new GPUProfiler(gl);
     maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
 
     // Configure textures with placeholder sizes. We'll need two textures for simulation (A,B), one for
@@ -999,6 +1017,26 @@ async function VisualPDE(url) {
     simTextures.push(simTextures[0].clone());
     postTexture = simTextures[0].clone();
     interpolationTexture = simTextures[0].clone();
+
+    // MRT (Multiple Render Target) pair for dual-output fusion passes.
+    // Two MRT targets (pingpong A/B), each with 2 color attachments.
+    mrtTargets = [0, 1].map(() => {
+      const mrt = new THREE.WebGLMultipleRenderTargets(
+        options.maxDisc,
+        options.maxDisc,
+        2,
+        simTextureOpts,
+      );
+      mrt.texture.forEach((tex) => {
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.minFilter = THREE.NearestFilter;
+        tex.magFilter = THREE.NearestFilter;
+        tex.type = THREE.FloatType;
+        tex.format = THREE.RGBAFormat;
+      });
+      return mrt;
+    });
 
     // Periodic boundary conditions (for now).
 
@@ -1117,6 +1155,59 @@ async function VisualPDE(url) {
         vertexShader: genericVertexShader(),
       });
     }
+    simMaterials.DGFE = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    simMaterials.DGStage = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    simMaterials.DGRK4Corr = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    // True ADER-DG materials: element-local predictor, dual-source Picard, dual-source corrector
+    simMaterials.DGADERPred = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    simMaterials.DGADERPicard2 = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    simMaterials.DGADERCorr2 = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    // Material for DG boundary averaging (enforces continuity at element boundaries)
+    simMaterials.DGBoundaryAvg = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+      fragmentShader: RDShaderDGBoundaryAvg(),
+    });
+    // Fused corrector + boundary averaging materials (Fusion A)
+    simMaterials.DGFEFused = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    simMaterials.DGStageFused = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    simMaterials.DGADERCorr2Fused = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    // MRT (Multiple Render Target) materials (Fusion B & C)
+    simMaterials.DGADERPredMRT = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
+    simMaterials.DGADERPicard2MRT = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: genericVertexShader(),
+    });
 
     copyMaterial = new THREE.ShaderMaterial({
       uniforms: uniforms,
@@ -1253,6 +1344,14 @@ async function VisualPDE(url) {
           if (event.key == "c") {
             options.resetFromCheckpoints = !options.resetFromCheckpoints;
             updateToggle($("#checkpointButton")[0]);
+          }
+          if (event.key == "p" && gpuProfiler) {
+            console.log(gpuProfiler.formatSummary());
+          }
+          if (event.key == "f") {
+            options.fusedKernels = !options.fusedKernels;
+            console.log("Kernel fusion:", options.fusedKernels ? "ON" : "OFF");
+            if (gpuProfiler) gpuProfiler.reset();
           }
         }
       }
@@ -1406,6 +1505,8 @@ async function VisualPDE(url) {
 
   function updateUniforms() {
     uniforms.dt.value = options.dt;
+    uniforms.dgActive.value = options.timesteppingScheme === "ADER-DG";
+    uniforms.dgOrder.value = getDGOrder();
     uniforms.heightScale.value = options.threeDHeightScale;
     uniforms.customSurface.value = options.customSurface;
     uniforms.vectorField.value = options.vectorField;
@@ -1416,6 +1517,12 @@ async function VisualPDE(url) {
     updateRandomSeed();
     uniforms.blendImage.value = options.blendImage == true;
     uniforms.blendImageAmount.value = Number(options.blendImageAmount);
+  }
+
+  function getDGOrder() {
+    let order = parseInt(options.dgOrder);
+    if (!Number.isFinite(order)) order = 2;
+    return Math.min(Math.max(order, 1), 4);
   }
 
   function updateSizeUniforms() {
@@ -1486,6 +1593,15 @@ async function VisualPDE(url) {
 
     nXDisc = Math.floor(domainWidth / spatialStepValue);
     nYDisc = Math.floor(domainHeight / spatialStepValue);
+    if (options.timesteppingScheme === "ADER-DG") {
+      const dgOrder = getDGOrder();
+      const elemSize = dgOrder * spatialStepValue;
+      let nElem = Math.floor(domainWidth / elemSize);
+      if (nElem < 1) nElem = 1;
+      nXDisc = nElem * (dgOrder + 1);
+      // Note: nYDisc is kept as the regular grid value for 2D ADER-DG
+      // The dimension == 1 check below will set nYDisc = 1 for 1D cases
+    }
     if (nXDisc > maxTexSize || nYDisc > maxTexSize) {
       throwError(
         "Your device does not support a discretisation this fine (maximum " +
@@ -1624,6 +1740,10 @@ async function VisualPDE(url) {
     simTextures[0] = simTextures[1].clone();
 
     postTexture.setSize(nXDisc + shift, nYDisc + shift);
+    // Resize MRT targets to match simulation textures.
+    if (mrtTargets) {
+      mrtTargets.forEach((mrt) => mrt.setSize(nXDisc + shift, nYDisc + shift));
+    }
     postprocess();
 
     // Dispose of and create new minmax textures.
@@ -1744,6 +1864,14 @@ async function VisualPDE(url) {
         type: "f",
         value: 0.01,
       },
+      dgActive: {
+        type: "bool",
+        value: false,
+      },
+      dgOrder: {
+        type: "f",
+        value: 2,
+      },
       // Discrete step sizes in the texture, which will be set later.
       dx: {
         type: "f",
@@ -1827,6 +1955,38 @@ async function VisualPDE(url) {
       },
       textureSource3: {
         type: "t",
+      },
+      stageAlpha: {
+        type: "f",
+        value: 1.0,
+      },
+      stageDelta: {
+        type: "f",
+        value: 0.0,
+      },
+      stageBeta: {
+        type: "f",
+        value: 1.0,
+      },
+      stageWeight1: {
+        type: "f",
+        value: 0.25,
+      },
+      stageWeight2: {
+        type: "f",
+        value: 0.25,
+      },
+      stageBeta2: {
+        type: "f",
+        value: 1.0,
+      },
+      stageWeight1b: {
+        type: "f",
+        value: 0.25,
+      },
+      stageWeight2b: {
+        type: "f",
+        value: 0.25,
       },
       t: {
         type: "f",
@@ -2073,10 +2233,43 @@ async function VisualPDE(url) {
         "Adams-Bashforth 2": "AB2",
         "Midpoint Method": "Mid",
         "Runge-Kutta 4": "RK4",
+        "Ader" : "ADER", 
+        "ADER-DG": "ADER-DG",
       })
-      .name("Scheme")
-      .onChange(function () {
+      .name("Scheme");
+    {
+      let prevScheme = options.timesteppingScheme;
+      controllers["timesteppingScheme"].onChange(function () {
         document.activeElement.blur();
+        // Auto-scale dt when switching to/from ADER-DG for stability
+        if (options.timesteppingScheme === "ADER-DG" && prevScheme !== "ADER-DG") {
+          const dgOrder = getDGOrder();
+          const scaleFactor = 2 * dgOrder + 1;
+          options.dt = options.dt / scaleFactor;
+          controllers["dt"].updateDisplay();
+        } else if (options.timesteppingScheme !== "ADER-DG" && prevScheme === "ADER-DG") {
+          const dgOrder = getDGOrder();
+          const scaleFactor = 2 * dgOrder + 1;
+          options.dt = options.dt * scaleFactor;
+          controllers["dt"].updateDisplay();
+        }
+        prevScheme = options.timesteppingScheme;
+        updateUniforms();
+        updateShaders();
+        configureDimension();
+        renderIfNotRunning();
+        configureGUI();
+      });
+    }
+
+    controllers["dgOrder"] = root
+      .add(options, "dgOrder", 1, 4, 1)
+      .name("DG order")
+      .onChange(function () {
+        this.setValue(getDGOrder());
+        updateUniforms();
+        setRDEquations();
+        renderIfNotRunning();
       });
 
     const timeButtonList = addButtonList(root);
@@ -3826,6 +4019,8 @@ async function VisualPDE(url) {
           break;
         }
       }
+      // Signal end of frame to GPU profiler (collects timing results).
+      if (gpuProfiler) gpuProfiler.frameEnd();
     }
 
     // Render if something has happened.
@@ -4042,6 +4237,7 @@ async function VisualPDE(url) {
 
     // Use the scheme specified in options.timesteppingScheme.
     switch (options.timesteppingScheme) {
+      case "ADER": 
       case "Euler":
         simDomain.material = simMaterials["FE"];
         uniforms.textureSource.value = simTextures[1].texture;
@@ -4051,6 +4247,20 @@ async function VisualPDE(url) {
         renderer.render(simScene, simCamera);
         simTextures.rotate(-1);
         uniforms.t.value += options.dt;
+        break;
+      case "ADER-DG":
+        aderDgTimestep(
+          simDomain,
+          simMaterials,
+          uniforms,
+          simTextures,
+          renderer,
+          simScene,
+          simCamera,
+          options,
+          gpuProfiler,
+          mrtTargets,
+        );
         break;
       case "AB2":
         simDomain.material = simMaterials["AB2"];
@@ -4481,6 +4691,65 @@ async function VisualPDE(url) {
     NaNTimer = setTimeout(checkForNaN, 1000);
     isRunning = true;
   }
+
+  // ── Benchmark: compare unfused vs fused kernel performance ──────────
+  // Call from browser console: window.benchmarkFusion(200)
+  // Runs N timesteps with fusion off, then N with fusion on,
+  // and prints a comparison of GPU pass timings.
+  window.benchmarkFusion = function (numSteps = 200) {
+    if (options.timesteppingScheme !== "ADER-DG") {
+      console.warn("Benchmark requires ADER-DG timestepping scheme.");
+      return;
+    }
+    const wasPaused = !isRunning;
+    const savedT = uniforms.t.value;
+
+    const runN = (label, fused) => {
+      options.fusedKernels = fused;
+      gpuProfiler.reset();
+      // Warm up (5 frames)
+      for (let i = 0; i < 5; i++) {
+        timestep();
+        gpuProfiler.frameEnd();
+      }
+      gpuProfiler.reset();
+      const t0 = performance.now();
+      for (let i = 0; i < numSteps; i++) {
+        timestep();
+        gpuProfiler.frameEnd();
+      }
+      // Force GPU finish
+      gl.finish();
+      const wallMs = performance.now() - t0;
+      const summary = gpuProfiler.getSummary();
+      console.log(`\n=== ${label} (${numSteps} timesteps) ===`);
+      console.log(`Wall time: ${wallMs.toFixed(1)} ms  (${(wallMs / numSteps).toFixed(2)} ms/step)`);
+      console.log(gpuProfiler.formatSummary());
+      return { wallMs, summary };
+    };
+
+    console.log(`%cADER-DG Kernel Fusion Benchmark (order=${options.dgOrder}, ${numSteps} steps)`, "font-weight:bold;font-size:14px");
+
+    const unfused = runN("UNFUSED (original)", false);
+    // Reset simulation state
+    uniforms.t.value = savedT;
+    resetSim();
+
+    const fused = runN("FUSED (kernel fusion)", true);
+    uniforms.t.value = savedT;
+
+    // Summary comparison
+    const speedup = unfused.wallMs / fused.wallMs;
+    console.log(`\n%c=== COMPARISON ===`, "font-weight:bold;color:#0a0");
+    console.log(`Unfused: ${unfused.wallMs.toFixed(1)} ms  |  Fused: ${fused.wallMs.toFixed(1)} ms`);
+    console.log(`Speedup: ${speedup.toFixed(2)}x`);
+    if (unfused.summary.totalUs > 0 && fused.summary.totalUs > 0) {
+      const gpuSpeedup = unfused.summary.totalUs / fused.summary.totalUs;
+      console.log(`GPU time speedup: ${gpuSpeedup.toFixed(2)}x`);
+    }
+
+    if (wasPaused) pauseSim();
+  };
 
   function resetSim() {
     if (options.setSeed) {
@@ -5113,6 +5382,20 @@ async function VisualPDE(url) {
     }
     shaderContainsRAND = containsRAND || containsRANDN;
     let bot = [dirichletShader, algebraicShader, RDShaderBot()].join(" ");
+    let botMRT = [dirichletShader, algebraicShader, RDShaderBotMRT()].join(" ");
+
+    // Create a DG-specific middle section with the computeRHS function
+    // The function includes the reaction and diffusion string definitions inside it
+    let diffusionStringsDG = parseNormalDiffusionStrings() + "\n";
+    if (options.crossDiffusion) {
+      diffusionStringsDG += parseCrossDiffusionStrings() + "\n";
+    }
+    let middleDG = RDShaderDGComputeRHS(
+      Number(options.numSpecies),
+      parseReactionStrings(),
+      diffusionStringsDG,
+      options.crossDiffusion,
+    );
 
     let type = "FE";
     assignFragmentShader(
@@ -5169,6 +5452,73 @@ async function VisualPDE(url) {
             middle,
             insertRates(RDShaderMain(type + ind.toString())),
             bot,
+          ].join(" "),
+        ),
+      );
+    }
+
+    type = "DGFE";
+    assignFragmentShader(
+      simMaterials[type],
+      replaceMINXMINY(
+        [
+          kineticStr,
+          RDShaderTopDG(),
+          middleDG,
+          insertRates(RDShaderMainDG(type)),
+          bot,
+        ].join(" "),
+      ),
+    );
+
+    // SSPRK/RK4 stage shaders (DGStage for generic Shu-Osher stages, DGRK4Corr for RK4 final)
+    // plus true ADER-DG shaders (DGADERPred, DGADERPicard2, DGADERCorr2)
+    for (const aderType of ["DGStage", "DGRK4Corr", "DGADERPred", "DGADERPicard2", "DGADERCorr2"]) {
+      assignFragmentShader(
+        simMaterials[aderType],
+        replaceMINXMINY(
+          [
+            kineticStr,
+            RDShaderTopDG(),
+            middleDG,
+            insertRates(RDShaderMainDG(aderType)),
+            bot,
+          ].join(" "),
+        ),
+      );
+    }
+
+    // Fused corrector + boundary averaging shaders (Fusion A)
+    for (const fusedType of ["DGFEFused", "DGStageFused", "DGADERCorr2Fused"]) {
+      assignFragmentShader(
+        simMaterials[fusedType],
+        replaceMINXMINY(
+          [
+            kineticStr,
+            RDShaderTopDG(),
+            middleDG,
+            insertRates(RDShaderMainDG(fusedType)),
+            bot,
+          ].join(" "),
+        ),
+      );
+    }
+
+    // MRT (dual-output) shaders (Fusion B & C)
+    // Declare a second fragment output at location 1 for MRT.
+    // Three.js auto-declares layout(location=0) as pc_fragColor (#defined to gl_FragColor).
+    const mrtOutputDecl = "layout(location = 1) out highp vec4 fragData1;";
+    for (const mrtType of ["DGADERPredMRT", "DGADERPicard2MRT"]) {
+      assignFragmentShader(
+        simMaterials[mrtType],
+        replaceMINXMINY(
+          [
+            kineticStr,
+            RDShaderTopDG(),
+            middleDG,
+            mrtOutputDecl,
+            insertRates(RDShaderMainDG(mrtType)),
+            botMRT,
           ].join(" "),
         ),
       );
@@ -6299,12 +6649,18 @@ async function VisualPDE(url) {
       controller.slider.style.setProperty("--max", controller.slider.max);
       controllers["dt"].hide();
       controllers["timesteppingScheme"].hide();
+      controllers["dgOrder"].hide();
     } else {
       setGUIControllerName(controllers["numTimestepsPerFrame"], "Steps/frame");
       controller.slider.max = 400;
       controller.slider.style.setProperty("--max", controller.slider.max);
       controllers["dt"].show();
       controllers["timesteppingScheme"].show();
+      if (options.timesteppingScheme === "ADER-DG") {
+        controllers["dgOrder"].show();
+      } else {
+        controllers["dgOrder"].hide();
+      }
     }
 
     // Show/hide the indicator function controller.

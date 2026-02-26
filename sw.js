@@ -1,4 +1,4 @@
-const cacheName = "offline-cache-v1";
+const cacheName = "offline-cache-v4";
 const cacheUrls = [
   "/sim/css",
   "/sim/css/main.css",
@@ -78,6 +78,7 @@ const cacheUrls = [
   "/sim/scripts/RD/clear_shader.js",
   "/sim/scripts/RD/display_shaders.js",
   "/sim/scripts/RD/drawing_shaders.js",
+  "/sim/scripts/RD/ader_dg.js",
   "/sim/scripts/RD/main.js",
   "/sim/scripts/RD/minify_preset.js",
   "/sim/scripts/RD/post_shaders.js",
